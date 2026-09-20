@@ -19,7 +19,8 @@ const server = http.createServer((req, res) => {
     res.end(JSON.stringify({ status: 'Ephemeral Relay Server Running', activeSessions: sessions.size }));
 });
 
-const wss = new WebSocket.Server({ server, path: '/ws' });
+// Allow WebSocket connections on root '/' as well as '/ws'
+const wss = new WebSocket.Server({ server });
 
 // In-Memory ephemeral sessions: Map<pairingCode, Session>
 const sessions = new Map();
@@ -119,15 +120,24 @@ function handleMessage(ws, data) {
         case 'CALL_ANSWER':
         case 'ICE_CANDIDATE':
         case 'CALL_END': {
-            // Relay strictly between paired peers
+            console.log(`[RELAY] ${data.type} from: ${data.from} code: ${data.pairingCode}`);
             const clientInfo = clients.get(ws);
-            if (!clientInfo) return;
-            const session = sessions.get(clientInfo.pairingCode);
+            const pairingCode = data.pairingCode || clientInfo?.pairingCode;
+            if (!pairingCode) return;
+
+            const session = sessions.get(pairingCode);
             if (!session) return;
 
-            const targetWs = session.userA?.ws === ws ? session.userB?.ws : session.userA?.ws;
+            // Route to the peer
+            const targetWs = (session.userA?.userId === data.from || session.userA?.ws === ws)
+                ? session.userB?.ws
+                : session.userA?.ws;
+
             if (targetWs && targetWs.readyState === WebSocket.OPEN) {
                 targetWs.send(JSON.stringify(data));
+                console.log(`[RELAY] Delivered ${data.type} to peer`);
+            } else {
+                console.log(`[RELAY] Target peer socket not open`);
             }
             break;
         }
