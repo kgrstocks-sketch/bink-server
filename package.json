@@ -1,0 +1,13 @@
+{
+  "name": "chat1-ephemeral-server",
+  "version": "1.0.0",
+  "description": "Zero-persistence ephemeral communication server for exactly two users",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "untun": "^0.2.2",
+    "ws": "^8.18.0"
+  }
+}
