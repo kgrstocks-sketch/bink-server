@@ -19,8 +19,8 @@ const server = http.createServer((req, res) => {
     res.end(JSON.stringify({ status: 'Ephemeral Relay Server Running', activeSessions: sessions.size }));
 });
 
-// Allow WebSocket connections on root '/' as well as '/ws'
-const wss = new WebSocket.Server({ server });
+// Allow WebSocket connections on root '/' as well as '/ws', configure maxPayload to 50MB for media/voice notes
+const wss = new WebSocket.Server({ server, maxPayload: 50 * 1024 * 1024 });
 
 // In-Memory ephemeral sessions: Map<pairingCode, Session>
 const sessions = new Map();
@@ -29,6 +29,7 @@ const clients = new Map();
 
 wss.on('connection', (ws) => {
     console.log('[WS] Client connected');
+    clients.set(ws, { pairingCode: null, userId: null });
 
     ws.on('message', (message) => {
         try {
@@ -41,20 +42,39 @@ wss.on('connection', (ws) => {
 
     ws.on('close', () => {
         const clientInfo = clients.get(ws);
-        if (clientInfo) {
+        if (clientInfo && clientInfo.pairingCode) {
             console.log(`[WS] Client disconnected: ${clientInfo.userId}`);
             const session = sessions.get(clientInfo.pairingCode);
             if (session) {
-                // Notify the other peer about disconnection
-                const peerWs = session.userA?.ws === ws ? session.userB?.ws : session.userA?.ws;
+                // If userA or userB left, clear them from session
+                if (session.userA?.ws === ws) session.userA = null;
+                if (session.userB?.ws === ws) session.userB = null;
+
+                const peerWs = session.userA ? session.userA.ws : (session.userB ? session.userB.ws : null);
                 if (peerWs && peerWs.readyState === WebSocket.OPEN) {
                     peerWs.send(JSON.stringify({ type: 'PEER_STATUS', online: false }));
                 }
+
+                // If room is completely empty, clean it up
+                if (!session.userA && !session.userB) {
+                    sessions.delete(clientInfo.pairingCode);
+                }
             }
-            clients.delete(ws);
+            // Broadcast room status change
+            broadcastRoomUpdate(clientInfo.pairingCode, false);
         }
+        clients.delete(ws);
     });
 });
+
+function broadcastRoomUpdate(pairingCode, hasPeer) {
+    const message = JSON.stringify({ type: 'ROOM_STATUS', pairingCode, hasPeer });
+    for (const [wsClient] of clients.entries()) {
+        if (wsClient.readyState === WebSocket.OPEN) {
+            wsClient.send(message);
+        }
+    }
+}
 
 function handleMessage(ws, data) {
     const { type } = data;
@@ -71,20 +91,38 @@ function handleMessage(ws, data) {
             });
             clients.set(ws, { pairingCode, userId });
             console.log(`[PAIR] Session created with code: ${pairingCode} by ${userId}`);
+            broadcastRoomUpdate(pairingCode, true);
             break;
         }
 
         case 'PAIR_JOIN': {
-            // User B joins pairing code
+            // User B joins pairing code (or initiates if session not yet created)
             const { pairingCode, userId, publicKey } = data;
-            const session = sessions.get(pairingCode);
+            let session = sessions.get(pairingCode);
 
             if (!session) {
-                ws.send(JSON.stringify({ type: 'PAIR_ERROR', error: 'Invalid or expired pairing code' }));
+                // If room does not exist yet, create it and wait for the second peer
+                sessions.set(pairingCode, {
+                    code: pairingCode,
+                    createdAt: Date.now(),
+                    userA: { ws, userId, publicKey },
+                    userB: null
+                });
+                clients.set(ws, { pairingCode, userId });
+                console.log(`[PAIR] Auto-created session for code: ${pairingCode} by ${userId}`);
+                // Broadcast to any other clients that a peer entered this room
+                broadcastRoomUpdate(pairingCode, true);
                 return;
             }
 
-            if (session.userB !== null) {
+            if (session.userA?.userId === userId) {
+                // Same user reconnecting
+                session.userA.ws = ws;
+                clients.set(ws, { pairingCode, userId });
+                return;
+            }
+
+            if (session.userB !== null && session.userB.userId !== userId) {
                 ws.send(JSON.stringify({ type: 'PAIR_ERROR', error: 'Session already has two participants' }));
                 return;
             }
@@ -120,7 +158,6 @@ function handleMessage(ws, data) {
         case 'CALL_ANSWER':
         case 'ICE_CANDIDATE':
         case 'CALL_END': {
-            console.log(`[RELAY] ${data.type} from: ${data.from} code: ${data.pairingCode}`);
             const clientInfo = clients.get(ws);
             const pairingCode = data.pairingCode || clientInfo?.pairingCode;
             if (!pairingCode) return;
@@ -128,16 +165,26 @@ function handleMessage(ws, data) {
             const session = sessions.get(pairingCode);
             if (!session) return;
 
-            // Route to the peer
-            const targetWs = (session.userA?.userId === data.from || session.userA?.ws === ws)
-                ? session.userB?.ws
-                : session.userA?.ws;
+            // Route strictly to the other party in this 2-person room
+            let targetWs = null;
+            if (session.userA?.ws === ws) {
+                targetWs = session.userB?.ws;
+            } else if (session.userB?.ws === ws) {
+                targetWs = session.userA?.ws;
+            } else if (session.userA?.userId === data.to) {
+                targetWs = session.userA?.ws;
+            } else if (session.userB?.userId === data.to) {
+                targetWs = session.userB?.ws;
+            } else {
+                // Fallback by from
+                targetWs = (session.userA?.userId === data.from) ? session.userB?.ws : session.userA?.ws;
+            }
 
             if (targetWs && targetWs.readyState === WebSocket.OPEN) {
                 targetWs.send(JSON.stringify(data));
-                console.log(`[RELAY] Delivered ${data.type} to peer`);
+                console.log(`[RELAY] Successfully relayed ${data.type} to other peer in session ${pairingCode}`);
             } else {
-                console.log(`[RELAY] Target peer socket not open`);
+                console.log(`[RELAY] Target peer not reachable for ${data.type}`);
             }
             break;
         }
@@ -163,6 +210,24 @@ function handleMessage(ws, data) {
 
         case 'HEARTBEAT': {
             ws.send(JSON.stringify({ type: 'HEARTBEAT_ACK', timestamp: Date.now() }));
+            break;
+        }
+
+        case 'CHECK_ROOM': {
+            const { pairingCode, userId } = data;
+            const session = sessions.get(pairingCode);
+            let hasPeer = false;
+            if (session) {
+                // Check if someone else is currently present in this room
+                const userAPresent = session.userA && session.userA.userId !== userId && session.userA.ws.readyState === WebSocket.OPEN;
+                const userBPresent = session.userB && session.userB.userId !== userId && session.userB.ws.readyState === WebSocket.OPEN;
+                hasPeer = !!(userAPresent || userBPresent);
+            }
+            ws.send(JSON.stringify({
+                type: 'ROOM_STATUS',
+                pairingCode,
+                hasPeer
+            }));
             break;
         }
     }
